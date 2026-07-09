@@ -16,7 +16,7 @@ and displays bounty income in real time.
 
 ## Requirements
 
-- Windows
+- Windows or Linux
 - Python 3.10 or newer with Tkinter
 - EVE game logging enabled for every account to be tracked
 
@@ -24,7 +24,7 @@ No third-party Python packages are required to run from source.
 
 ## Download
 
-Windows `.exe` builds are published from GitHub Releases.
+Windows and Linux builds are published from GitHub Releases.
 
 If you want to build manually, run:
 
@@ -39,6 +39,25 @@ The generated executable will be in:
 dist\EVE-ISK-Overlay.exe
 ```
 
+On Linux, install Tkinter first if your distribution does not include it:
+
+```bash
+sudo apt install python3-tk
+```
+
+Then build:
+
+```bash
+python3 -m pip install pyinstaller
+pyinstaller --noconfirm --clean --onefile --windowed --name eve-isk-overlay eve_isk_overlay.py
+```
+
+The generated executable will be in:
+
+```text
+dist/eve-isk-overlay
+```
+
 ## Run from source
 
 Open PowerShell in the project directory and run:
@@ -47,10 +66,32 @@ Open PowerShell in the project directory and run:
 python eve_isk_overlay.py
 ```
 
-The app automatically watches:
+On Linux or macOS, the source file can also be run directly:
+
+```bash
+chmod +x eve_isk_overlay.py
+./eve_isk_overlay.py
+```
+
+The app automatically watches the standard Windows log folder:
 
 ```text
 %USERPROFILE%\Documents\EVE\logs\Gamelogs
+```
+
+On Linux, it also checks common Steam Proton and Wine paths, including:
+
+```text
+~/.local/share/Steam/steamapps/compatdata/8500/pfx/drive_c/users/*/Documents/EVE/logs/Gamelogs
+~/.steam/steam/steamapps/compatdata/8500/pfx/drive_c/users/*/Documents/EVE/logs/Gamelogs
+~/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/compatdata/8500/pfx/drive_c/users/*/Documents/EVE/logs/Gamelogs
+~/.wine/drive_c/users/*/Documents/EVE/logs/Gamelogs
+```
+
+If your logs live somewhere else, set `EVE_LOG_DIR` before starting the app:
+
+```bash
+EVE_LOG_DIR="/path/to/Gamelogs" ./eve_isk_overlay.py
 ```
 
 Files modified during the last 60 seconds are shown as active. Recent inactive
@@ -75,8 +116,9 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The GitHub Actions workflow builds `EVE-ISK-Overlay.exe` on Windows and attaches
-it to the matching GitHub Release.
+The GitHub Actions workflow builds `EVE-ISK-Overlay.exe` on Windows and a
+Linux `eve-isk-overlay` executable archive, then attaches both to the matching
+GitHub Release.
 
 ## Privacy
 

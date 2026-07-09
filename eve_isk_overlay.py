@@ -1,9 +1,11 @@
+#!/usr/bin/env python3
 """Small always-on-top overlay for EVE Online bounty log income."""
 
 from __future__ import annotations
 
 import codecs
 import ctypes
+import os
 import re
 import sys
 import tkinter as tk
@@ -53,14 +55,79 @@ class FileState:
     listener_checked: bool = False
 
 
-def default_log_directory() -> Path:
+def windows_documents_directory() -> Path:
     documents = Path.home() / "Documents"
     if sys.platform == "win32":
         # Respect moved/OneDrive-backed Documents folders configured in Windows.
         buffer = ctypes.create_unicode_buffer(260)
         if ctypes.windll.shell32.SHGetFolderPathW(None, 5, None, 0, buffer) == 0:
             documents = Path(buffer.value)
-    return documents / "EVE" / "logs" / "Gamelogs"
+    return documents
+
+
+def default_log_directories() -> list[Path]:
+    """Return likely EVE game log directories for Windows, Linux, and Wine/Proton."""
+    home = Path.home()
+    candidates: list[Path] = []
+
+    def add(path: Path) -> None:
+        if path not in candidates:
+            candidates.append(path)
+
+    log_dir_env = os.environ.get("EVE_LOG_DIR")
+    if log_dir_env:
+        add(Path(log_dir_env).expanduser())
+
+    add(windows_documents_directory() / "EVE" / "logs" / "Gamelogs")
+
+    if sys.platform != "win32":
+        steam_roots = [
+            home / ".local" / "share" / "Steam",
+            home / ".steam" / "steam",
+            home / ".var" / "app" / "com.valvesoftware.Steam" / ".local" / "share" / "Steam",
+        ]
+        steam_root_env = os.environ.get("STEAM_ROOT")
+        if steam_root_env:
+            steam_roots.insert(0, Path(steam_root_env).expanduser())
+
+        for steam_root in steam_roots:
+            users_dir = (
+                steam_root
+                / "steamapps"
+                / "compatdata"
+                / "8500"
+                / "pfx"
+                / "drive_c"
+                / "users"
+            )
+            if users_dir.is_dir():
+                for user_dir in users_dir.iterdir():
+                    if user_dir.is_dir():
+                        add(user_dir / "Documents" / "EVE" / "logs" / "Gamelogs")
+            else:
+                add(users_dir / "steamuser" / "Documents" / "EVE" / "logs" / "Gamelogs")
+
+        wine_users = home / ".wine" / "drive_c" / "users"
+        if wine_users.is_dir():
+            for user_dir in wine_users.iterdir():
+                if user_dir.is_dir():
+                    add(user_dir / "Documents" / "EVE" / "logs" / "Gamelogs")
+        else:
+            add(
+                wine_users
+                / os.environ.get("USER", "steamuser")
+                / "Documents"
+                / "EVE"
+                / "logs"
+                / "Gamelogs"
+            )
+
+    existing = [path for path in candidates if path.is_dir()]
+    return existing or candidates[:1]
+
+
+def default_log_directory() -> Path:
+    return default_log_directories()[0]
 
 
 def parse_bounty_line(line: str) -> BountyEvent | None:
@@ -153,7 +220,8 @@ def estimate_with_ess(paid_amount: float, ess_percent: int) -> float:
 class IskOverlay(tk.Tk):
     def __init__(self, log_directory: Path | None = None) -> None:
         super().__init__()
-        self.log_directory = log_directory or default_log_directory()
+        self.log_directories = [log_directory] if log_directory else default_log_directories()
+        self.log_directory = self.log_directories[0]
         self.file_states: dict[Path, FileState] = {}
         self.session_files: set[Path] = set()
         self.session_started_at = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -359,34 +427,39 @@ class IskOverlay(tk.Tk):
             self.after(POLL_INTERVAL_MS, self.poll_logs)
 
     def _read_active_files(self) -> None:
-        if not self.log_directory.is_dir():
-            self.status_text.set(f"Waiting for {self.log_directory}")
+        existing_directories = [path for path in self.log_directories if path.is_dir()]
+        if not existing_directories:
+            if len(self.log_directories) == 1:
+                self.status_text.set(f"Waiting for {self.log_directories[0]}")
+            else:
+                self.status_text.set("Waiting for EVE game logs...")
             return
 
         now_epoch = datetime.now().timestamp()
         active_files: list[Path] = []
 
-        for path in self.log_directory.iterdir():
-            if not path.is_file():
-                continue
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
-            age_seconds = now_epoch - stat.st_mtime
-            # Load enough history to populate any selectable rolling window.
-            # "Active" remains the stricter 60-second status indicator.
-            if age_seconds <= MAX_WINDOW_MINUTES * 60:
-                self._read_new_lines(path, stat.st_size, stat.st_mtime_ns)
-            if age_seconds <= ACTIVE_FILE_SECONDS:
-                active_files.append(path)
-                if path not in self.session_files:
-                    self.session_files.add(path)
-                    file_started_at = log_start_time(path)
-                    if file_started_at is not None:
-                        self.session_started_at = min(
-                            self.session_started_at, file_started_at
-                        )
+        for log_directory in existing_directories:
+            for path in log_directory.iterdir():
+                if not path.is_file():
+                    continue
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                age_seconds = now_epoch - stat.st_mtime
+                # Load enough history to populate any selectable rolling window.
+                # "Active" remains the stricter 60-second status indicator.
+                if age_seconds <= MAX_WINDOW_MINUTES * 60:
+                    self._read_new_lines(path, stat.st_size, stat.st_mtime_ns)
+                if age_seconds <= ACTIVE_FILE_SECONDS:
+                    active_files.append(path)
+                    if path not in self.session_files:
+                        self.session_files.add(path)
+                        file_started_at = log_start_time(path)
+                        if file_started_at is not None:
+                            self.session_started_at = min(
+                                self.session_started_at, file_started_at
+                            )
 
         if self.last_error:
             self.status_text.set(f"Log error: {self.last_error}")
@@ -432,7 +505,7 @@ class IskOverlay(tk.Tk):
         if character_id is None:
             return None
         related = sorted(
-            self.log_directory.glob(f"*_{character_id}.txt"),
+            path.parent.glob(f"*_{character_id}.txt"),
             key=lambda candidate: candidate.stat().st_mtime,
             reverse=True,
         )
