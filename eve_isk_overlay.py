@@ -1,9 +1,12 @@
+#!/usr/bin/env python3
 """Small always-on-top overlay for EVE Online bounty log income."""
 
 from __future__ import annotations
 
 import codecs
+import configparser
 import ctypes
+import os
 import re
 import sys
 import tkinter as tk
@@ -22,6 +25,8 @@ DEFAULT_ESS_PERCENT = 100
 MIN_ESS_PERCENT = 100
 MAX_ESS_PERCENT = 200
 IMMEDIATE_PAYOUT_SHARE = 0.60
+CONFIG_FILE_ENV = "EVE_ISK_OVERLAY_CONFIG"
+CONFIG_FILE_NAME = "config.ini"
 
 BOUNTY_RE = re.compile(
     r"^\[\s*(?P<timestamp>\d{4}\.\d{2}\.\d{2}\s+\d{2}:\d{2}:\d{2})\s*\]"
@@ -53,14 +58,137 @@ class FileState:
     listener_checked: bool = False
 
 
-def default_log_directory() -> Path:
+def app_directory() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def config_file_path() -> Path:
+    override = os.environ.get(CONFIG_FILE_ENV)
+    if override:
+        return Path(override).expanduser()
+    return app_directory() / CONFIG_FILE_NAME
+
+
+def windows_documents_directory() -> Path:
     documents = Path.home() / "Documents"
     if sys.platform == "win32":
         # Respect moved/OneDrive-backed Documents folders configured in Windows.
         buffer = ctypes.create_unicode_buffer(260)
         if ctypes.windll.shell32.SHGetFolderPathW(None, 5, None, 0, buffer) == 0:
             documents = Path(buffer.value)
-    return documents / "EVE" / "logs" / "Gamelogs"
+    return documents
+
+
+def platform_default_log_directories() -> list[Path]:
+    """Return sensible default EVE log paths for the current operating system."""
+    home = Path.home()
+    if sys.platform == "win32":
+        return [windows_documents_directory() / "EVE" / "logs" / "Gamelogs"]
+
+    candidates: list[Path] = []
+
+    def add(path: Path) -> None:
+        if path not in candidates:
+            candidates.append(path)
+
+    steam_roots = [
+        home / ".local" / "share" / "Steam",
+        home / ".steam" / "steam",
+        home / ".var" / "app" / "com.valvesoftware.Steam" / ".local" / "share" / "Steam",
+    ]
+
+    for steam_root in steam_roots:
+        users_root = (
+            steam_root
+            / "steamapps"
+            / "compatdata"
+            / "8500"
+            / "pfx"
+            / "drive_c"
+            / "users"
+        )
+        if users_root.is_dir():
+            for user_dir in users_root.iterdir():
+                if user_dir.is_dir():
+                    add(user_dir / "Documents" / "EVE" / "logs" / "Gamelogs")
+        else:
+            add(users_root / "steamuser" / "Documents" / "EVE" / "logs" / "Gamelogs")
+
+    wine_users_root = home / ".wine" / "drive_c" / "users"
+    if wine_users_root.is_dir():
+        for user_dir in wine_users_root.iterdir():
+            if user_dir.is_dir():
+                add(user_dir / "Documents" / "EVE" / "logs" / "Gamelogs")
+    else:
+        add(
+            wine_users_root
+            / os.environ.get("USER", "steamuser")
+            / "Documents"
+            / "EVE"
+            / "logs"
+            / "Gamelogs"
+        )
+
+    add(home / "Documents" / "EVE" / "logs" / "Gamelogs")
+    existing = [path for path in candidates if path.is_dir()]
+    return existing or candidates
+
+
+def default_log_directory() -> Path:
+    return platform_default_log_directories()[0]
+
+
+def expand_config_path(value: str) -> Path:
+    value = value.strip().strip('"').strip("'")
+    value = os.path.expandvars(value)
+    value = re.sub(
+        r"%([^%]+)%",
+        lambda match: os.environ.get(match.group(1), match.group(0)),
+        value,
+    )
+    return Path(value).expanduser()
+
+
+def split_configured_paths(value: str) -> list[Path]:
+    paths: list[Path] = []
+    for line in value.splitlines():
+        line = line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        parts = [part.strip() for part in line.split(";") if part.strip()]
+        for part in parts:
+            path = expand_config_path(part)
+            if path not in paths:
+                paths.append(path)
+    return paths
+
+
+def create_default_config(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    config = configparser.ConfigParser(interpolation=None)
+    config["logs"] = {
+        "directories": "\n"
+        + "\n".join(str(path) for path in platform_default_log_directories())
+    }
+    with path.open("w", encoding="utf-8") as handle:
+        config.write(handle)
+
+
+def configured_log_directories(path: Path | None = None) -> list[Path]:
+    path = path or config_file_path()
+    if not path.exists():
+        create_default_config(path)
+
+    config = configparser.ConfigParser(interpolation=None)
+    config.read(path, encoding="utf-8")
+    raw_directories = config.get("logs", "directories", fallback="")
+    if not raw_directories:
+        raw_directories = config.get("logs", "directory", fallback="")
+
+    directories = split_configured_paths(raw_directories)
+    return directories or platform_default_log_directories()
 
 
 def parse_bounty_line(line: str) -> BountyEvent | None:
@@ -153,7 +281,13 @@ def estimate_with_ess(paid_amount: float, ess_percent: int) -> float:
 class IskOverlay(tk.Tk):
     def __init__(self, log_directory: Path | None = None) -> None:
         super().__init__()
-        self.log_directory = log_directory or default_log_directory()
+        self.config_path = config_file_path()
+        self.log_directories = (
+            [log_directory]
+            if log_directory
+            else configured_log_directories(self.config_path)
+        )
+        self.log_directory = self.log_directories[0]
         self.file_states: dict[Path, FileState] = {}
         self.session_files: set[Path] = set()
         self.session_started_at = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -359,34 +493,39 @@ class IskOverlay(tk.Tk):
             self.after(POLL_INTERVAL_MS, self.poll_logs)
 
     def _read_active_files(self) -> None:
-        if not self.log_directory.is_dir():
-            self.status_text.set(f"Waiting for {self.log_directory}")
+        existing_directories = [path for path in self.log_directories if path.is_dir()]
+        if not existing_directories:
+            if len(self.log_directories) == 1:
+                self.status_text.set(f"Waiting for {self.log_directories[0]}")
+            else:
+                self.status_text.set(f"Waiting for log paths in {self.config_path.name}")
             return
 
         now_epoch = datetime.now().timestamp()
         active_files: list[Path] = []
 
-        for path in self.log_directory.iterdir():
-            if not path.is_file():
-                continue
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
-            age_seconds = now_epoch - stat.st_mtime
-            # Load enough history to populate any selectable rolling window.
-            # "Active" remains the stricter 60-second status indicator.
-            if age_seconds <= MAX_WINDOW_MINUTES * 60:
-                self._read_new_lines(path, stat.st_size, stat.st_mtime_ns)
-            if age_seconds <= ACTIVE_FILE_SECONDS:
-                active_files.append(path)
-                if path not in self.session_files:
-                    self.session_files.add(path)
-                    file_started_at = log_start_time(path)
-                    if file_started_at is not None:
-                        self.session_started_at = min(
-                            self.session_started_at, file_started_at
-                        )
+        for log_directory in existing_directories:
+            for path in log_directory.iterdir():
+                if not path.is_file():
+                    continue
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                age_seconds = now_epoch - stat.st_mtime
+                # Load enough history to populate any selectable rolling window.
+                # "Active" remains the stricter 60-second status indicator.
+                if age_seconds <= MAX_WINDOW_MINUTES * 60:
+                    self._read_new_lines(path, stat.st_size, stat.st_mtime_ns)
+                if age_seconds <= ACTIVE_FILE_SECONDS:
+                    active_files.append(path)
+                    if path not in self.session_files:
+                        self.session_files.add(path)
+                        file_started_at = log_start_time(path)
+                        if file_started_at is not None:
+                            self.session_started_at = min(
+                                self.session_started_at, file_started_at
+                            )
 
         if self.last_error:
             self.status_text.set(f"Log error: {self.last_error}")
@@ -432,7 +571,7 @@ class IskOverlay(tk.Tk):
         if character_id is None:
             return None
         related = sorted(
-            self.log_directory.glob(f"*_{character_id}.txt"),
+            path.parent.glob(f"*_{character_id}.txt"),
             key=lambda candidate: candidate.stat().st_mtime,
             reverse=True,
         )

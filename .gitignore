@@ -1,0 +1,8 @@
+config.ini
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec
+release-job-log/
+release-job-log.zip
