@@ -9,6 +9,10 @@ displays bounty income in real time.
 - Optional ESS delayed-payout estimation
 - Session total and elapsed session time
 - Per-character totals read from each log's `Listener:` header
+- Current-session and all-time high scores for 10-minute, 60-minute, and
+  session-total performance
+- AFK detection that pauses rolling ISK/hour after 2 minutes without bounty
+  income
 - Compact M/B ISK formatting
 - Rolling-rate trend graph
 - Configurable Windows, Linux, Wine, and Steam Proton log paths
@@ -124,6 +128,22 @@ ESS estimation is enabled by default. At 100%, a logged immediate payment of
 only the delayed 40% share is scaled. Session and per-character totals always
 show raw logged ISK and are not changed by the ESS modifier.
 
+## High scores and AFK
+
+The app stores all-time high scores in `high_scores.json` next to the script or
+executable. The file is created automatically and ignored by Git.
+
+Tracked highs:
+
+- best 10-minute rolling ISK/hour
+- best 60-minute rolling ISK/hour
+- best session total
+
+If no bounty is seen for 2 minutes, time after that grace period is counted as
+AFK. AFK time is shown in the session line, drawn orange on the rate graph, and
+removed from the rolling ISK/hour denominator so the average pauses during that
+AFK section.
+
 ## Release
 
 Maintainers can publish new Windows and Linux executable builds by pushing a
@@ -142,4 +162,5 @@ Release.
 
 All processing happens locally. The app reads game logs from the configured EVE
 log directories and does not send data over the network. `config.ini` is ignored
-by Git so personal paths are not committed accidentally.
+by Git so personal paths are not committed accidentally. `high_scores.json` is
+also ignored because it contains local performance history.

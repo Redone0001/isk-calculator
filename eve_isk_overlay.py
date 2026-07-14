@@ -6,6 +6,7 @@ from __future__ import annotations
 import codecs
 import configparser
 import ctypes
+import json
 import os
 import re
 import sys
@@ -25,8 +26,11 @@ DEFAULT_ESS_PERCENT = 100
 MIN_ESS_PERCENT = 100
 MAX_ESS_PERCENT = 200
 IMMEDIATE_PAYOUT_SHARE = 0.60
+AFK_THRESHOLD_SECONDS = 120
 CONFIG_FILE_ENV = "EVE_ISK_OVERLAY_CONFIG"
 CONFIG_FILE_NAME = "config.ini"
+HIGH_SCORE_FILE_ENV = "EVE_ISK_OVERLAY_HIGH_SCORES"
+HIGH_SCORE_FILE_NAME = "high_scores.json"
 
 BOUNTY_RE = re.compile(
     r"^\[\s*(?P<timestamp>\d{4}\.\d{2}\.\d{2}\s+\d{2}:\d{2}:\d{2})\s*\]"
@@ -46,6 +50,16 @@ LISTENER_RE = re.compile(
 class BountyEvent:
     timestamp: datetime
     amount: int
+
+
+@dataclass(frozen=True)
+class RollingStats:
+    total: float
+    hourly_rate: float
+    active_seconds: float
+    afk_seconds: float
+    is_afk: bool
+    afk_intervals: list[tuple[datetime, datetime]]
 
 
 @dataclass
@@ -69,6 +83,57 @@ def config_file_path() -> Path:
     if override:
         return Path(override).expanduser()
     return app_directory() / CONFIG_FILE_NAME
+
+
+def high_score_file_path() -> Path:
+    override = os.environ.get(HIGH_SCORE_FILE_ENV)
+    if override:
+        return Path(override).expanduser()
+    return app_directory() / HIGH_SCORE_FILE_NAME
+
+
+def default_high_scores() -> dict[str, object]:
+    return {
+        "version": 1,
+        "all_time": {
+            "rolling_10m_isk_per_hour": 0.0,
+            "rolling_60m_isk_per_hour": 0.0,
+            "session_total_isk": 0.0,
+        },
+    }
+
+
+def load_high_scores(path: Path | None = None) -> dict[str, object]:
+    path = path or high_score_file_path()
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        data = default_high_scores()
+        save_high_scores(data, path)
+        return data
+    except (OSError, json.JSONDecodeError):
+        return default_high_scores()
+
+    if not isinstance(data, dict):
+        return default_high_scores()
+    all_time = data.setdefault("all_time", {})
+    if not isinstance(all_time, dict):
+        data["all_time"] = default_high_scores()["all_time"]
+        return data
+
+    defaults = default_high_scores()["all_time"]
+    for key, value in defaults.items():
+        all_time.setdefault(key, value)
+    data.setdefault("version", 1)
+    return data
+
+
+def save_high_scores(scores: dict[str, object], path: Path | None = None) -> None:
+    path = path or high_score_file_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(scores, handle, indent=2, sort_keys=True)
 
 
 def windows_documents_directory() -> Path:
@@ -230,6 +295,18 @@ def format_million_isk(value: float) -> str:
     return f"{value / 1_000_000:.2f} M ISK/h"
 
 
+def format_short_isk_rate(value: float) -> str:
+    if abs(value) >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.2f} B/h"
+    return f"{value / 1_000_000:.2f} M/h"
+
+
+def format_short_isk(value: float) -> str:
+    if abs(value) >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.2f} B"
+    return f"{value / 1_000_000:.2f} M"
+
+
 def format_duration(seconds: float) -> str:
     total_seconds = max(0, int(seconds))
     hours, remainder = divmod(total_seconds, 3_600)
@@ -288,18 +365,24 @@ class IskOverlay(tk.Tk):
             else configured_log_directories(self.config_path)
         )
         self.log_directory = self.log_directories[0]
+        self.high_score_path = high_score_file_path()
+        self.high_scores = load_high_scores(self.high_score_path)
+        self.session_high_10m = 0.0
+        self.session_high_60m = 0.0
+        self.session_high_total = 0.0
+        self.last_bounty_at: datetime | None = None
         self.file_states: dict[Path, FileState] = {}
         self.session_files: set[Path] = set()
         self.session_started_at = datetime.now(timezone.utc).replace(tzinfo=None)
         self.events: deque[BountyEvent] = deque()
-        self.rate_history: deque[tuple[datetime, float]] = deque()
+        self.rate_history: deque[tuple[datetime, float, bool]] = deque()
         self.last_error: str | None = None
         self.selected_character = "__all__"
         self.character_keys: list[str] = []
 
         self.title("EVE ISK")
-        self.geometry("350x285")
-        self.minsize(330, 265)
+        self.geometry("360x330")
+        self.minsize(340, 310)
         self.attributes("-topmost", True)
         self.configure(bg="#10151c")
         self.protocol("WM_DELETE_WINDOW", self.destroy)
@@ -309,6 +392,10 @@ class IskOverlay(tk.Tk):
         self.ess_percent = tk.IntVar(value=DEFAULT_ESS_PERCENT)
         self.rate_text = tk.StringVar(value="0 ISK/h")
         self.session_text = tk.StringVar(value="Session 0.00 M ISK · 00:00")
+        self.high_score_text = tk.StringVar(
+            value="Session highs 10m 0.00 M/h · 60m 0.00 M/h"
+        )
+        self.all_time_high_text = tk.StringVar(value="All-time highs loading…")
         self.trend_text = tk.StringVar(value="RATE TREND · 10 MIN")
         self.status_text = tk.StringVar(value="Starting…")
         self._build_ui()
@@ -396,6 +483,16 @@ class IskOverlay(tk.Tk):
         ttk.Label(panel, textvariable=self.rate_text, style="Rate.TLabel").pack(
             anchor="w", pady=(5, 0)
         )
+        ttk.Label(
+            panel,
+            textvariable=self.high_score_text,
+            style="Session.TLabel",
+        ).pack(anchor="w", pady=(1, 0))
+        ttk.Label(
+            panel,
+            textvariable=self.all_time_high_text,
+            style="Status.TLabel",
+        ).pack(anchor="w", pady=(0, 0))
 
         ess_row = ttk.Frame(panel, style="Panel.TFrame")
         ess_row.pack(fill="x", pady=(7, 0))
@@ -532,6 +629,15 @@ class IskOverlay(tk.Tk):
         elif active_files:
             noun = "file" if len(active_files) == 1 else "files"
             self.status_text.set(f"Watching {len(active_files)} active {noun}")
+        elif self.last_bounty_at is not None:
+            now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+            afk_start = self.last_bounty_at + timedelta(seconds=AFK_THRESHOLD_SECONDS)
+            if now_utc > afk_start:
+                self.status_text.set(
+                    f"AFK {format_duration((now_utc - afk_start).total_seconds())}"
+                )
+            else:
+                self.status_text.set("Waiting for an active game log…")
         else:
             self.status_text.set("Waiting for an active game log…")
 
@@ -561,6 +667,8 @@ class IskOverlay(tk.Tk):
             if event is not None:
                 self.events.append(event)
                 state.bounty_total += event.amount
+                if self.last_bounty_at is None or event.timestamp > self.last_bounty_at:
+                    self.last_bounty_at = event.timestamp
 
         state.processed_lines = len(lines)
         state.size = size
@@ -586,38 +694,162 @@ class IskOverlay(tk.Tk):
                 return listener
         return None
 
-    def update_display(self, record_history: bool = False) -> None:
-        minutes = self._window_size()
-        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    def _afk_intervals(
+        self, start: datetime, end: datetime
+    ) -> list[tuple[datetime, datetime]]:
+        if end <= start:
+            return []
+
+        threshold = timedelta(seconds=AFK_THRESHOLD_SECONDS)
+        timestamps = sorted(
+            event.timestamp
+            for event in self.events
+            if event.timestamp <= end + timedelta(seconds=5)
+        )
+
+        previous: datetime | None = None
+        intervals: list[tuple[datetime, datetime]] = []
+        for timestamp in timestamps:
+            if timestamp < start:
+                previous = timestamp
+                continue
+            if previous is not None:
+                afk_start = previous + threshold
+                afk_end = timestamp
+                if afk_end > afk_start:
+                    clipped_start = max(start, afk_start)
+                    clipped_end = min(end, afk_end)
+                    if clipped_end > clipped_start:
+                        intervals.append((clipped_start, clipped_end))
+            previous = timestamp
+
+        if previous is None and self.last_bounty_at is not None:
+            previous = self.last_bounty_at
+
+        if previous is not None:
+            afk_start = previous + threshold
+            if end > afk_start:
+                clipped_start = max(start, afk_start)
+                if end > clipped_start:
+                    intervals.append((clipped_start, end))
+
+        return intervals
+
+    @staticmethod
+    def _interval_seconds(intervals: list[tuple[datetime, datetime]]) -> float:
+        return sum((end - start).total_seconds() for start, end in intervals)
+
+    def _rolling_stats(self, minutes: int, now_utc: datetime) -> RollingStats:
         cutoff = now_utc - timedelta(minutes=minutes)
-
-        # Keep a little extra history so increasing the window remains useful.
-        history_cutoff = now_utc - timedelta(minutes=MAX_WINDOW_MINUTES)
-        if self.events:
-            self.events = deque(event for event in self.events if event.timestamp >= history_cutoff)
-
-        total = sum(
+        raw_total = sum(
             event.amount
             for event in self.events
             if cutoff <= event.timestamp <= now_utc + timedelta(seconds=5)
         )
+        total = float(raw_total)
         if self.ess_enabled.get():
             total = estimate_with_ess(total, self._ess_percentage())
 
-        hourly_rate = total * (60 / minutes)
-        self.rate_text.set(format_million_isk(hourly_rate))
+        afk_intervals = self._afk_intervals(cutoff, now_utc)
+        afk_seconds = self._interval_seconds(afk_intervals)
+        active_seconds = max(1.0, minutes * 60 - afk_seconds)
+        hourly_rate = total * (3600 / active_seconds)
+        is_afk = any(start <= now_utc <= end for start, end in afk_intervals)
+        return RollingStats(
+            total=total,
+            hourly_rate=hourly_rate,
+            active_seconds=active_seconds,
+            afk_seconds=afk_seconds,
+            is_afk=is_afk,
+            afk_intervals=afk_intervals,
+        )
+
+    def _update_high_scores(
+        self,
+        rate_10m: float,
+        rate_60m: float,
+        session_total: float,
+    ) -> None:
+        self.session_high_10m = max(self.session_high_10m, rate_10m)
+        self.session_high_60m = max(self.session_high_60m, rate_60m)
+        self.session_high_total = max(self.session_high_total, session_total)
+
+        all_time = self.high_scores.setdefault("all_time", {})
+        if not isinstance(all_time, dict):
+            all_time = {}
+            self.high_scores["all_time"] = all_time
+
+        changed = False
+        high_values = {
+            "rolling_10m_isk_per_hour": rate_10m,
+            "rolling_60m_isk_per_hour": rate_60m,
+            "session_total_isk": session_total,
+        }
+        for key, value in high_values.items():
+            current = float(all_time.get(key, 0) or 0)
+            if value > current:
+                all_time[key] = value
+                changed = True
+
+        self.high_score_text.set(
+            "Session highs "
+            f"10m {format_short_isk_rate(self.session_high_10m)} · "
+            f"60m {format_short_isk_rate(self.session_high_60m)} · "
+            f"total {format_short_isk(self.session_high_total)}"
+        )
+        self.all_time_high_text.set(
+            "All-time "
+            "10m "
+            f"{format_short_isk_rate(float(all_time.get('rolling_10m_isk_per_hour', 0) or 0))} · "
+            "60m "
+            f"{format_short_isk_rate(float(all_time.get('rolling_60m_isk_per_hour', 0) or 0))} · "
+            f"session {format_short_isk(float(all_time.get('session_total_isk', 0) or 0))}"
+        )
+
+        if changed:
+            save_high_scores(self.high_scores, self.high_score_path)
+
+    def update_display(self, record_history: bool = False) -> None:
+        minutes = self._window_size()
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+
+        # Keep a little extra history so increasing the window remains useful.
+        history_cutoff = now_utc - timedelta(minutes=MAX_WINDOW_MINUTES)
+        if self.events:
+            self.events = deque(
+                event for event in self.events if event.timestamp >= history_cutoff
+            )
+
+        rolling_stats = self._rolling_stats(minutes, now_utc)
+        self.rate_text.set(format_million_isk(rolling_stats.hourly_rate))
         session_total = sum(
             self.file_states[path].bounty_total
             for path in self.session_files
             if path in self.file_states
         )
         session_duration = (now_utc - self.session_started_at).total_seconds()
-        self.session_text.set(format_session_total(session_total, session_duration))
+        session_afk_seconds = self._interval_seconds(
+            self._afk_intervals(self.session_started_at, now_utc)
+        )
+        session_label = format_session_total(session_total, session_duration)
+        if session_afk_seconds >= 60:
+            session_label += f" · AFK {format_duration(session_afk_seconds)}"
+        self.session_text.set(session_label)
         self._update_character_dropdown(session_total)
+
+        stats_10m = self._rolling_stats(10, now_utc)
+        stats_60m = self._rolling_stats(60, now_utc)
+        self._update_high_scores(
+            stats_10m.hourly_rate,
+            stats_60m.hourly_rate,
+            session_total,
+        )
         self.trend_text.set(f"RATE TREND · {minutes} MIN")
 
         if record_history:
-            self.rate_history.append((now_utc, hourly_rate))
+            self.rate_history.append(
+                (now_utc, rolling_stats.hourly_rate, rolling_stats.is_afk)
+            )
         history_cutoff = now_utc - timedelta(minutes=MAX_WINDOW_MINUTES)
         self.rate_history = deque(
             point for point in self.rate_history if point[0] >= history_cutoff
@@ -670,7 +902,11 @@ class IskOverlay(tk.Tk):
         now_utc = now_utc or datetime.now(timezone.utc).replace(tzinfo=None)
         minutes = minutes or self._window_size()
         cutoff = now_utc - timedelta(minutes=minutes)
-        points = [(when, value) for when, value in self.rate_history if when >= cutoff]
+        points = [
+            (when, value, is_afk)
+            for when, value, is_afk in self.rate_history
+            if when >= cutoff
+        ]
 
         padding = 5
         canvas.create_line(
@@ -683,33 +919,32 @@ class IskOverlay(tk.Tk):
         if not points:
             return
 
-        values = [value for _, value in points]
+        values = [value for _, value, _is_afk in points]
         low, high = min(values), max(values)
         if high == low:
             low = 0
             high = max(high, 1)
 
         span_seconds = max(minutes * 60, 1)
-        coordinates: list[float] = []
-        for when, value in points:
+        coordinates: list[tuple[float, float, bool]] = []
+        for when, value, is_afk in points:
             elapsed = (when - cutoff).total_seconds()
             x = padding + (elapsed / span_seconds) * (width - 2 * padding)
             y = height - padding - ((value - low) / (high - low)) * (
                 height - 2 * padding
             )
-            coordinates.extend((x, y))
+            coordinates.append((x, y, is_afk))
 
         if len(points) == 1:
-            x, y = coordinates
-            canvas.create_oval(x - 2, y - 2, x + 2, y + 2, fill="#6ee7a0", outline="")
+            x, y, is_afk = coordinates[0]
+            color = "#f59e0b" if is_afk else "#6ee7a0"
+            canvas.create_oval(x - 2, y - 2, x + 2, y + 2, fill=color, outline="")
         else:
-            canvas.create_line(
-                *coordinates,
-                fill="#6ee7a0",
-                width=2,
-                smooth=True,
-                splinesteps=12,
-            )
+            for previous, current in zip(coordinates, coordinates[1:]):
+                x1, y1, was_afk = previous
+                x2, y2, is_afk = current
+                color = "#f59e0b" if was_afk or is_afk else "#6ee7a0"
+                canvas.create_line(x1, y1, x2, y2, fill=color, width=2)
 
 
 def main() -> None:
