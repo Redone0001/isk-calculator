@@ -11,6 +11,7 @@ displays bounty income in real time.
 - Per-character totals read from each log's `Listener:` header
 - Current-session and all-time high scores for 10-minute, 60-minute, and
   session-total performance
+- Session-only rare spawn counter for large bounty events
 - AFK detection that pauses rolling ISK/hour after 2 minutes without bounty
   income
 - Compact M/B ISK formatting
@@ -143,6 +144,19 @@ If no bounty is seen for 2 minutes, time after that grace period is counted as
 AFK. AFK time is shown in the session line, drawn orange on the rate graph, and
 removed from the rolling ISK/hour denominator so the average pauses during that
 AFK section.
+
+## Rare spawns
+
+The overlay also keeps a session-only rare spawn counter. A bounty line is
+considered rare when:
+
+```text
+logged bounty amount * active game log files > 3,000,000 ISK
+```
+
+Matching rare hits with the same timestamp and estimated fleet bounty are
+counted once, so the same rare spawn seen by multiple active clients should not
+inflate the counter.
 
 ## Release
 

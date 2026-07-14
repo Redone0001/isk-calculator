@@ -27,6 +27,7 @@ MIN_ESS_PERCENT = 100
 MAX_ESS_PERCENT = 200
 IMMEDIATE_PAYOUT_SHARE = 0.60
 AFK_THRESHOLD_SECONDS = 120
+RARE_SPAWN_THRESHOLD_ISK = 3_000_000
 CONFIG_FILE_ENV = "EVE_ISK_OVERLAY_CONFIG"
 CONFIG_FILE_NAME = "config.ini"
 HIGH_SCORE_FILE_ENV = "EVE_ISK_OVERLAY_HIGH_SCORES"
@@ -371,6 +372,9 @@ class IskOverlay(tk.Tk):
         self.session_high_60m = 0.0
         self.session_high_total = 0.0
         self.last_bounty_at: datetime | None = None
+        self.active_file_count = 1
+        self.rare_spawn_count = 0
+        self.rare_spawn_keys: set[tuple[str, int]] = set()
         self.file_states: dict[Path, FileState] = {}
         self.session_files: set[Path] = set()
         self.session_started_at = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -392,6 +396,7 @@ class IskOverlay(tk.Tk):
         self.ess_percent = tk.IntVar(value=DEFAULT_ESS_PERCENT)
         self.rate_text = tk.StringVar(value="0 ISK/h")
         self.session_text = tk.StringVar(value="Session 0.00 M ISK · 00:00")
+        self.rare_spawn_text = tk.StringVar(value="Rare 0")
         self.high_score_text = tk.StringVar(
             value="Session highs 10m 0.00 M/h · 60m 0.00 M/h"
         )
@@ -542,6 +547,12 @@ class IskOverlay(tk.Tk):
         ).pack(side="left")
         ttk.Label(
             status_row,
+            textvariable=self.rare_spawn_text,
+            style="Session.TLabel",
+            anchor="e",
+        ).pack(side="right", padx=(8, 0))
+        ttk.Label(
+            status_row,
             textvariable=self.session_text,
             style="Session.TLabel",
             anchor="e",
@@ -599,7 +610,7 @@ class IskOverlay(tk.Tk):
             return
 
         now_epoch = datetime.now().timestamp()
-        active_files: list[Path] = []
+        file_stats: list[tuple[Path, os.stat_result, float]] = []
 
         for log_directory in existing_directories:
             for path in log_directory.iterdir():
@@ -610,19 +621,27 @@ class IskOverlay(tk.Tk):
                 except OSError:
                     continue
                 age_seconds = now_epoch - stat.st_mtime
-                # Load enough history to populate any selectable rolling window.
-                # "Active" remains the stricter 60-second status indicator.
-                if age_seconds <= MAX_WINDOW_MINUTES * 60:
-                    self._read_new_lines(path, stat.st_size, stat.st_mtime_ns)
-                if age_seconds <= ACTIVE_FILE_SECONDS:
-                    active_files.append(path)
-                    if path not in self.session_files:
-                        self.session_files.add(path)
-                        file_started_at = log_start_time(path)
-                        if file_started_at is not None:
-                            self.session_started_at = min(
-                                self.session_started_at, file_started_at
-                            )
+                file_stats.append((path, stat, age_seconds))
+
+        active_files = [
+            path for path, _stat, age_seconds in file_stats
+            if age_seconds <= ACTIVE_FILE_SECONDS
+        ]
+        self.active_file_count = max(1, len(active_files))
+
+        for path, stat, age_seconds in file_stats:
+            # Load enough history to populate any selectable rolling window.
+            # "Active" remains the stricter 60-second status indicator.
+            if age_seconds <= MAX_WINDOW_MINUTES * 60:
+                self._read_new_lines(path, stat.st_size, stat.st_mtime_ns)
+            if age_seconds <= ACTIVE_FILE_SECONDS:
+                if path not in self.session_files:
+                    self.session_files.add(path)
+                    file_started_at = log_start_time(path)
+                    if file_started_at is not None:
+                        self.session_started_at = min(
+                            self.session_started_at, file_started_at
+                        )
 
         if self.last_error:
             self.status_text.set(f"Log error: {self.last_error}")
@@ -669,6 +688,7 @@ class IskOverlay(tk.Tk):
                 state.bounty_total += event.amount
                 if self.last_bounty_at is None or event.timestamp > self.last_bounty_at:
                     self.last_bounty_at = event.timestamp
+                self._track_rare_spawn(event)
 
         state.processed_lines = len(lines)
         state.size = size
@@ -693,6 +713,21 @@ class IskOverlay(tk.Tk):
             if listener:
                 return listener
         return None
+
+    def _track_rare_spawn(self, event: BountyEvent) -> None:
+        estimated_fleet_bounty = event.amount * self.active_file_count
+        if estimated_fleet_bounty <= RARE_SPAWN_THRESHOLD_ISK:
+            return
+
+        key = (
+            event.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            int(estimated_fleet_bounty),
+        )
+        if key in self.rare_spawn_keys:
+            return
+
+        self.rare_spawn_keys.add(key)
+        self.rare_spawn_count += 1
 
     def _afk_intervals(
         self, start: datetime, end: datetime
@@ -835,6 +870,7 @@ class IskOverlay(tk.Tk):
         if session_afk_seconds >= 60:
             session_label += f" · AFK {format_duration(session_afk_seconds)}"
         self.session_text.set(session_label)
+        self.rare_spawn_text.set(f"Rare {self.rare_spawn_count}")
         self._update_character_dropdown(session_total)
 
         stats_10m = self._rolling_stats(10, now_utc)
